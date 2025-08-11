@@ -3,9 +3,9 @@ import re
 import requests
 import openai
 import google.generativeai as genai
-import spacy
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
+from transformers import pipeline
 
 # Load API keys from environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -22,8 +22,8 @@ if GEMINI_API_KEY:
 app = Flask(__name__, static_folder="static")
 CORS(app)
 
-# Load scispaCy model once
-nlp = spacy.load("en_core_sci_sm")
+# Initialize HuggingFace NER pipeline globally
+ner_pipeline = pipeline("ner", grouped_entities=True)
 
 # Basic abusive words list (expand as needed)
 ABUSIVE_WORDS = ["idiot", "stupid", "dumb", "hate", "shut up", "fool", "damn", "bastard", "crap"]
@@ -35,12 +35,12 @@ def contains_abuse(text):
             return True
     return False
 
-def google_search_with_citations(query, num_results=5, broad=False):
+def google_search_with_citations(query, num_results=5, use_broad=False):
     """Perform Google Custom Search and return results with formatted citations."""
     if not GOOGLE_SEARCH_KEY:
-        return [], ""  # Skip search if keys missing
+        return [], ""  # Skip search if key missing
 
-    cx = GOOGLE_SEARCH_CX_BROAD if broad else GOOGLE_SEARCH_CX_RESTRICTED
+    cx = GOOGLE_SEARCH_CX_BROAD if use_broad else GOOGLE_SEARCH_CX_RESTRICTED
     if not cx:
         return [], ""
 
@@ -83,23 +83,9 @@ def is_answer_incomplete(answer_text, user_query):
 
     return False
 
-def extract_types_from_snippets(results):
-    """
-    Look for patterns like 'types of', 'kinds of', 'subtypes' in snippets to extract types.
-    Returns a string summary of types found or empty string.
-    """
-    types_texts = []
-    pattern = re.compile(r"(types|kinds|subtypes|categories) of ([\w\s,]+)", re.IGNORECASE)
-    for res in results:
-        for match in pattern.finditer(res.get("snippet", "")):
-            types_str = match.group(2).strip()
-            types_texts.append(types_str)
-    return "\n".join(types_texts)
-
 def generate_answer_with_sources(messages, results):
     """Generate an answer using OpenAI or Gemini based on search results and conversation."""
-
-    extracted_types = extract_types_from_snippets(results)
+    # Compose system prompt with web results
     formatted_results_text = ""
     for idx, item in enumerate(results, start=1):
         formatted_results_text += f"[{idx}] {item['title']}\n{item['snippet']}\nSource: {item['link']}\n\n"
@@ -112,11 +98,8 @@ def generate_answer_with_sources(messages, results):
         "Answer the user's questions based on the following web search results. "
         "If you cannot find a clear answer, politely say you don't know and recommend consulting a healthcare professional. "
         "Cite your sources with numbers like [1], [2], etc.\n\n"
+        f"{formatted_results_text}\n"
     )
-    if extracted_types:
-        system_prompt += f"Here are some types or categories extracted from the search results:\n{extracted_types}\n\n"
-
-    system_prompt += f"{formatted_results_text}\n"
 
     openai_messages = [{"role": "system", "content": system_prompt}]
     openai_messages.extend(messages)
@@ -154,18 +137,25 @@ def generate_answer_with_sources(messages, results):
 
 def get_last_medical_topic(messages):
     """
-    Extract medical entities from user messages using scispaCy NLP,
-    return the most recent relevant entity as last topic.
+    Use HuggingFace NER model to extract the last mentioned medical topic from user messages.
     """
     for msg in reversed(messages):
-        if msg.get("role") != "user":
-            continue
-        text = msg.get("content", "")
-        doc = nlp(text)
-        # Extract entities labeled as DISEASE, DISORDER, SYMPTOM, CONDITION in scispaCy
-        entities = [ent.text for ent in doc.ents if ent.label_ in {"DISEASE", "DISORDER", "SYMPTOM", "CONDITION"}]
-        if entities:
-            return entities[0].lower()
+        if msg.get("role") == "user":
+            text = msg.get("content", "")
+            entities = ner_pipeline(text)
+
+            # Debug: print detected entities (optional, remove in production)
+            # print("Detected entities:", entities)
+
+            # Filter entities for medical or relevant groups — adjust labels based on your model's output
+            # Common labels for generic NER: 'ORG', 'MISC', 'LOC', 'PERSON'
+            # For medical-specific models, labels might be 'DISEASE', 'CONDITION', 'SYMPTOM', etc.
+            # Here we accept all entity groups for broad matching; you can refine as needed:
+            medical_entities = [e['word'] for e in entities if e['entity_group'].lower() in ('m', 'misc', 'org', 'disease', 'condition', 'symptom', 'medical')]
+
+            if medical_entities:
+                return medical_entities[-1].lower()
+
     return None
 
 def rewrite_query(query, last_topic):
@@ -207,17 +197,17 @@ def search_answer():
     if latest_user_message.lower() in greetings:
         return jsonify({"answer": "Hi! How may I help you with your medical questions today?", "sources": []})
 
-    # Resolve pronouns using NLP entity extraction
+    # --- Resolve pronouns using HuggingFace NER ---
     last_topic = get_last_medical_topic(messages)
     search_query = rewrite_query(latest_user_message, last_topic)
 
-    # Search with rewritten query on restricted CX
-    results, _ = google_search_with_citations(search_query, num_results=5, broad=False)
+    # First search: restricted sites
+    results, _ = google_search_with_citations(search_query, num_results=5, use_broad=False)
     answer = generate_answer_with_sources(messages, results)
 
-    # If incomplete answer, fallback to broader CX with more results
+    # If incomplete answer, fallback to broader search
     if is_answer_incomplete(answer, latest_user_message):
-        fallback_results, _ = google_search_with_citations(search_query, num_results=15, broad=True)
+        fallback_results, _ = google_search_with_citations(search_query, num_results=15, use_broad=True)
         answer = generate_answer_with_sources(messages, fallback_results)
         return jsonify({"answer": answer, "sources": fallback_results})
 
@@ -230,6 +220,7 @@ def serve_index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
