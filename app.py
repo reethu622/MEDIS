@@ -3,10 +3,9 @@ import re
 import requests
 import openai
 import google.generativeai as genai
+import spacy
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-
-import spacy
 
 # Load API keys from environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -23,11 +22,8 @@ if GEMINI_API_KEY:
 app = Flask(__name__, static_folder="static")
 CORS(app)
 
-# Load scispacy model (small)
-try:
-    nlp = spacy.load("en_core_sci_sm")
-except Exception:
-    nlp = None
+# Load scispaCy model once
+nlp = spacy.load("en_core_sci_sm")
 
 # Basic abusive words list (expand as needed)
 ABUSIVE_WORDS = ["idiot", "stupid", "dumb", "hate", "shut up", "fool", "damn", "bastard", "crap"]
@@ -39,56 +35,18 @@ def contains_abuse(text):
             return True
     return False
 
-def extract_medical_keywords(messages):
-    """
-    Extract medical keywords/entities from conversation messages using scispacy.
-    If unavailable, fallback to OpenAI extraction.
-    Returns the most relevant keyword or None.
-    """
-    text = " ".join([msg.get("content", "") for msg in messages])
-    if nlp:
-        doc = nlp(text)
-        # scispacy entity labels vary; here checking common ones related to conditions
-        entities = [ent.text.lower() for ent in doc.ents if ent.label_ in ["DISEASE", "CONDITION", "SYMPTOM", "ANATOMY"]]
-        if entities:
-            return entities[-1]
-    else:
-        # Fallback: Use OpenAI to extract medical keywords (simplified)
-        prompt = (
-            "Extract the main medical condition or topic from the following text. "
-            "If none, say NONE.\n\n"
-            + text
-        )
-        try:
-            response = openai.Completion.create(
-                engine="text-davinci-003",
-                prompt=prompt,
-                max_tokens=10,
-                temperature=0,
-                n=1,
-                stop=None,
-            )
-            keyword = response.choices[0].text.strip().lower()
-            if keyword and keyword != "none":
-                return keyword
-        except Exception as e:
-            print(f"OpenAI keyword extraction error: {e}")
-    return None
+def google_search_with_citations(query, num_results=5, broad=False):
+    """Perform Google Custom Search and return results with formatted citations."""
+    if not GOOGLE_SEARCH_KEY:
+        return [], ""  # Skip search if keys missing
 
-def google_search_with_citations(query, num_results=5, site_restrictions=None, api_key=None, cx=None):
-    """Perform Google Custom Search with optional site restrictions and custom API keys."""
-    key = api_key or GOOGLE_SEARCH_KEY
-    search_cx = cx or GOOGLE_SEARCH_CX_RESTRICTED  # default restricted
-
-    if not key or not search_cx:
+    cx = GOOGLE_SEARCH_CX_BROAD if broad else GOOGLE_SEARCH_CX_RESTRICTED
+    if not cx:
         return [], ""
 
-    if site_restrictions:
-        query = f"{query} {site_restrictions}"
-
     params = {
-        "key": key,
-        "cx": search_cx,
+        "key": GOOGLE_SEARCH_KEY,
+        "cx": cx,
         "q": query,
         "num": num_results
     }
@@ -125,9 +83,23 @@ def is_answer_incomplete(answer_text, user_query):
 
     return False
 
+def extract_types_from_snippets(results):
+    """
+    Look for patterns like 'types of', 'kinds of', 'subtypes' in snippets to extract types.
+    Returns a string summary of types found or empty string.
+    """
+    types_texts = []
+    pattern = re.compile(r"(types|kinds|subtypes|categories) of ([\w\s,]+)", re.IGNORECASE)
+    for res in results:
+        for match in pattern.finditer(res.get("snippet", "")):
+            types_str = match.group(2).strip()
+            types_texts.append(types_str)
+    return "\n".join(types_texts)
+
 def generate_answer_with_sources(messages, results):
     """Generate an answer using OpenAI or Gemini based on search results and conversation."""
-    # Compose system prompt with web results
+
+    extracted_types = extract_types_from_snippets(results)
     formatted_results_text = ""
     for idx, item in enumerate(results, start=1):
         formatted_results_text += f"[{idx}] {item['title']}\n{item['snippet']}\nSource: {item['link']}\n\n"
@@ -140,8 +112,11 @@ def generate_answer_with_sources(messages, results):
         "Answer the user's questions based on the following web search results. "
         "If you cannot find a clear answer, politely say you don't know and recommend consulting a healthcare professional. "
         "Cite your sources with numbers like [1], [2], etc.\n\n"
-        f"{formatted_results_text}\n"
     )
+    if extracted_types:
+        system_prompt += f"Here are some types or categories extracted from the search results:\n{extracted_types}\n\n"
+
+    system_prompt += f"{formatted_results_text}\n"
 
     openai_messages = [{"role": "system", "content": system_prompt}]
     openai_messages.extend(messages)
@@ -176,6 +151,22 @@ def generate_answer_with_sources(messages, results):
 
     # If no LLM keys, return fallback message
     return "I don't know. Please consult a medical professional."
+
+def get_last_medical_topic(messages):
+    """
+    Extract medical entities from user messages using scispaCy NLP,
+    return the most recent relevant entity as last topic.
+    """
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        text = msg.get("content", "")
+        doc = nlp(text)
+        # Extract entities labeled as DISEASE, DISORDER, SYMPTOM, CONDITION in scispaCy
+        entities = [ent.text for ent in doc.ents if ent.label_ in {"DISEASE", "DISORDER", "SYMPTOM", "CONDITION"}]
+        if entities:
+            return entities[0].lower()
+    return None
 
 def rewrite_query(query, last_topic):
     """
@@ -216,23 +207,17 @@ def search_answer():
     if latest_user_message.lower() in greetings:
         return jsonify({"answer": "Hi! How may I help you with your medical questions today?", "sources": []})
 
-    # Extract medical keyword to handle pronouns
-    last_topic = extract_medical_keywords(messages)
+    # Resolve pronouns using NLP entity extraction
+    last_topic = get_last_medical_topic(messages)
     search_query = rewrite_query(latest_user_message, last_topic)
 
-    # Perform restricted Google search
-    results, _ = google_search_with_citations(search_query, num_results=5)
-
+    # Search with rewritten query on restricted CX
+    results, _ = google_search_with_citations(search_query, num_results=5, broad=False)
     answer = generate_answer_with_sources(messages, results)
 
-    # If incomplete answer, fallback to broader Google search
+    # If incomplete answer, fallback to broader CX with more results
     if is_answer_incomplete(answer, latest_user_message):
-        fallback_results, _ = google_search_with_citations(
-            search_query,
-            num_results=15,
-            api_key=GOOGLE_SEARCH_KEY,
-            cx=GOOGLE_SEARCH_CX_BROAD
-        )
+        fallback_results, _ = google_search_with_citations(search_query, num_results=15, broad=True)
         answer = generate_answer_with_sources(messages, fallback_results)
         return jsonify({"answer": answer, "sources": fallback_results})
 
@@ -245,5 +230,6 @@ def serve_index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
 
 
