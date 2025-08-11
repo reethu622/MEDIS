@@ -1,6 +1,3 @@
-import warnings
-warnings.simplefilter(action='ignore', category=FutureWarning)
-
 import os
 import re
 import requests
@@ -8,8 +5,8 @@ import openai
 import google.generativeai as genai
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
+
 import spacy
-from scispacy.abbreviation import AbbreviationDetector
 
 # Load API keys from environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -26,9 +23,11 @@ if GEMINI_API_KEY:
 app = Flask(__name__, static_folder="static")
 CORS(app)
 
-# Load SciSpacy model globally
-nlp = spacy.load("en_core_sci_sm")
-nlp.add_pipe("abbreviation_detector")
+# Load scispacy model (small)
+try:
+    nlp = spacy.load("en_core_sci_sm")
+except Exception:
+    nlp = None
 
 # Basic abusive words list (expand as needed)
 ABUSIVE_WORDS = ["idiot", "stupid", "dumb", "hate", "shut up", "fool", "damn", "bastard", "crap"]
@@ -40,14 +39,56 @@ def contains_abuse(text):
             return True
     return False
 
-def google_search_with_citations(query, num_results=5, cx=None):
-    """Perform Google Custom Search and return results with formatted citations."""
-    if not GOOGLE_SEARCH_KEY or not cx:
+def extract_medical_keywords(messages):
+    """
+    Extract medical keywords/entities from conversation messages using scispacy.
+    If unavailable, fallback to OpenAI extraction.
+    Returns the most relevant keyword or None.
+    """
+    text = " ".join([msg.get("content", "") for msg in messages])
+    if nlp:
+        doc = nlp(text)
+        # scispacy entity labels vary; here checking common ones related to conditions
+        entities = [ent.text.lower() for ent in doc.ents if ent.label_ in ["DISEASE", "CONDITION", "SYMPTOM", "ANATOMY"]]
+        if entities:
+            return entities[-1]
+    else:
+        # Fallback: Use OpenAI to extract medical keywords (simplified)
+        prompt = (
+            "Extract the main medical condition or topic from the following text. "
+            "If none, say NONE.\n\n"
+            + text
+        )
+        try:
+            response = openai.Completion.create(
+                engine="text-davinci-003",
+                prompt=prompt,
+                max_tokens=10,
+                temperature=0,
+                n=1,
+                stop=None,
+            )
+            keyword = response.choices[0].text.strip().lower()
+            if keyword and keyword != "none":
+                return keyword
+        except Exception as e:
+            print(f"OpenAI keyword extraction error: {e}")
+    return None
+
+def google_search_with_citations(query, num_results=5, site_restrictions=None, api_key=None, cx=None):
+    """Perform Google Custom Search with optional site restrictions and custom API keys."""
+    key = api_key or GOOGLE_SEARCH_KEY
+    search_cx = cx or GOOGLE_SEARCH_CX_RESTRICTED  # default restricted
+
+    if not key or not search_cx:
         return [], ""
 
+    if site_restrictions:
+        query = f"{query} {site_restrictions}"
+
     params = {
-        "key": GOOGLE_SEARCH_KEY,
-        "cx": cx,
+        "key": key,
+        "cx": search_cx,
         "q": query,
         "num": num_results
     }
@@ -105,6 +146,7 @@ def generate_answer_with_sources(messages, results):
     openai_messages = [{"role": "system", "content": system_prompt}]
     openai_messages.extend(messages)
 
+    # Try OpenAI first
     if OPENAI_API_KEY:
         try:
             resp = openai.ChatCompletion.create(
@@ -118,6 +160,7 @@ def generate_answer_with_sources(messages, results):
             if "quota" not in str(e).lower():
                 return f"OpenAI error: {e}"
 
+    # Fallback to Gemini
     if GEMINI_API_KEY:
         try:
             conversation_text = system_prompt + "\nConversation:\n"
@@ -131,76 +174,64 @@ def generate_answer_with_sources(messages, results):
         except Exception as e:
             return f"Gemini error: {e}"
 
+    # If no LLM keys, return fallback message
     return "I don't know. Please consult a medical professional."
 
-def get_last_medical_entity(messages):
+def rewrite_query(query, last_topic):
     """
-    Extract last mentioned medical entity from conversation using SciSpacy NER.
+    Replace ambiguous pronouns with last_topic if found.
     """
-    for msg in reversed(messages):
-        text = msg.get("content", "")
-        doc = nlp(text)
-        # Extract entities with UMLS concepts (likely medical)
-        medical_entities = [ent.text for ent in doc.ents if ent._.umls_ents]
-        if medical_entities:
-            return medical_entities[-1]  # Return the last entity found in this message
-    return None
-
-def rewrite_query(query, last_entity):
-    if not last_entity:
+    if not last_topic:
         return query
 
     pronouns = ["it", "those", "these", "that", "them"]
     pattern = re.compile(r"\b(" + "|".join(pronouns) + r")\b", flags=re.IGNORECASE)
-    new_query = pattern.sub(last_entity, query)
+    new_query = pattern.sub(last_topic, query)
     return new_query
 
 @app.route("/api/v1/search_answer", methods=["POST"])
 def search_answer():
     data = request.get_json()
-    print("Received data:", data)
-    
     messages = data.get("messages")
-    if not messages:
-        return jsonify({"answer": "No messages provided.", "sources": []})
+    if not messages or not isinstance(messages, list):
+        return jsonify({"answer": "Please provide conversation history as a list of messages.", "sources": []})
 
-    # Find latest user message
     latest_user_message = None
     for msg in reversed(messages):
         if msg.get("role") == "user":
-            latest_user_message = msg.get("content")
+            latest_user_message = msg.get("content", "").strip()
             break
-    
-    print("Latest user message:", latest_user_message)
-    
+
     if not latest_user_message:
-        return jsonify({"answer": "No user message found.", "sources": []})
+        return jsonify({"answer": "No user message found in conversation.", "sources": []})
 
-    # Then your existing logic, e.g., check abuse, greetings, run search, etc.
-    # For debugging, just return a dummy answer for now:
-    return jsonify({
-        "answer": f"Received your question: {latest_user_message}",
-        "sources": []
-    })
-
+    if contains_abuse(latest_user_message):
+        polite_response = (
+            "I am here to help with medical questions. "
+            "Please keep the conversation respectful. How can I assist you today?"
+        )
+        return jsonify({"answer": polite_response, "sources": []})
 
     greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
     if latest_user_message.lower() in greetings:
         return jsonify({"answer": "Hi! How may I help you with your medical questions today?", "sources": []})
 
-    last_entity = get_last_medical_entity(messages)
-    search_query = rewrite_query(latest_user_message, last_entity)
+    # Extract medical keyword to handle pronouns
+    last_topic = extract_medical_keywords(messages)
+    search_query = rewrite_query(latest_user_message, last_topic)
 
-    # 1. Search restricted trusted medical sites first
-    results, _ = google_search_with_citations(
-        search_query, num_results=5, cx=GOOGLE_SEARCH_CX_RESTRICTED
-    )
+    # Perform restricted Google search
+    results, _ = google_search_with_citations(search_query, num_results=5)
+
     answer = generate_answer_with_sources(messages, results)
 
-    # 2. If incomplete answer or no results, search broader trusted medical sites only
-    if is_answer_incomplete(answer, latest_user_message) or len(results) == 0:
+    # If incomplete answer, fallback to broader Google search
+    if is_answer_incomplete(answer, latest_user_message):
         fallback_results, _ = google_search_with_citations(
-            search_query, num_results=10, cx=GOOGLE_SEARCH_CX_BROAD
+            search_query,
+            num_results=15,
+            api_key=GOOGLE_SEARCH_KEY,
+            cx=GOOGLE_SEARCH_CX_BROAD
         )
         answer = generate_answer_with_sources(messages, fallback_results)
         return jsonify({"answer": answer, "sources": fallback_results})
@@ -214,4 +245,5 @@ def serve_index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
 
