@@ -5,6 +5,8 @@ import openai
 import google.generativeai as genai
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
+import spacy
+from scispacy.abbreviation import AbbreviationDetector
 
 # Load API keys from environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -20,6 +22,10 @@ if GEMINI_API_KEY:
 
 app = Flask(__name__, static_folder="static")
 CORS(app)
+
+# Load SciSpacy model globally
+nlp = spacy.load("en_core_sci_sm")
+nlp.add_pipe("abbreviation_detector")
 
 # Basic abusive words list (expand as needed)
 ABUSIVE_WORDS = ["idiot", "stupid", "dumb", "hate", "shut up", "fool", "damn", "bastard", "crap"]
@@ -124,27 +130,26 @@ def generate_answer_with_sources(messages, results):
 
     return "I don't know. Please consult a medical professional."
 
-def get_last_medical_topic(messages):
-    medical_terms = [
-        "diabetes", "asthma", "cancer", "migraine", "hypertension",
-        "glaucoma", "stroke", "arthritis", "depression", "anxiety",
-        "covid", "influenza", "pneumonia", "eczema", "alzheimer", "parkinson"
-    ]
-
+def get_last_medical_entity(messages):
+    """
+    Extract last mentioned medical entity from conversation using SciSpacy NER.
+    """
     for msg in reversed(messages):
-        text = msg.get("content", "").lower()
-        for term in medical_terms:
-            if term in text:
-                return term
+        text = msg.get("content", "")
+        doc = nlp(text)
+        # Extract entities with UMLS concepts (likely medical)
+        medical_entities = [ent.text for ent in doc.ents if ent._.umls_ents]
+        if medical_entities:
+            return medical_entities[-1]  # Return the last entity found in this message
     return None
 
-def rewrite_query(query, last_topic):
-    if not last_topic:
+def rewrite_query(query, last_entity):
+    if not last_entity:
         return query
 
     pronouns = ["it", "those", "these", "that", "them"]
     pattern = re.compile(r"\b(" + "|".join(pronouns) + r")\b", flags=re.IGNORECASE)
-    new_query = pattern.sub(last_topic, query)
+    new_query = pattern.sub(last_entity, query)
     return new_query
 
 @app.route("/api/v1/search_answer", methods=["POST"])
@@ -174,8 +179,8 @@ def search_answer():
     if latest_user_message.lower() in greetings:
         return jsonify({"answer": "Hi! How may I help you with your medical questions today?", "sources": []})
 
-    last_topic = get_last_medical_topic(messages)
-    search_query = rewrite_query(latest_user_message, last_topic)
+    last_entity = get_last_medical_entity(messages)
+    search_query = rewrite_query(latest_user_message, last_entity)
 
     # 1. Search restricted trusted medical sites first
     results, _ = google_search_with_citations(
@@ -200,3 +205,4 @@ def serve_index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
