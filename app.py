@@ -158,25 +158,31 @@ def rewrite_query(query, last_entity):
 @app.route("/api/v1/search_answer", methods=["POST"])
 def search_answer():
     data = request.get_json()
+    print("Received data:", data)
+    
     messages = data.get("messages")
-    if not messages or not isinstance(messages, list):
-        return jsonify({"answer": "Please provide conversation history as a list of messages.", "sources": []})
+    if not messages:
+        return jsonify({"answer": "No messages provided.", "sources": []})
 
+    # Find latest user message
     latest_user_message = None
     for msg in reversed(messages):
         if msg.get("role") == "user":
-            latest_user_message = msg.get("content", "").strip()
+            latest_user_message = msg.get("content")
             break
-
+    
+    print("Latest user message:", latest_user_message)
+    
     if not latest_user_message:
-        return jsonify({"answer": "No user message found in conversation.", "sources": []})
+        return jsonify({"answer": "No user message found.", "sources": []})
 
-    if contains_abuse(latest_user_message):
-        polite_response = (
-            "I am here to help with medical questions. "
-            "Please keep the conversation respectful. How can I assist you today?"
-        )
-        return jsonify({"answer": polite_response, "sources": []})
+    # Then your existing logic, e.g., check abuse, greetings, run search, etc.
+    # For debugging, just return a dummy answer for now:
+    return jsonify({
+        "answer": f"Received your question: {latest_user_message}",
+        "sources": []
+    })
+
 
     greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
     if latest_user_message.lower() in greetings:
